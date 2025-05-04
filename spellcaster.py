@@ -2,39 +2,31 @@ import cv2
 import mediapipe as mp
 import pyautogui
 import time
-from collections import deque
 
 # Setup
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(min_detection_confidence=0.7, max_num_hands=2)
-mp_drawing = mp.solutions.drawing_utils
 cap = cv2.VideoCapture(1)
+cap.set(3, 320)  # Very low width
+cap.set(4, 180)  # Very low height
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(min_detection_confidence=0.7, max_num_hands=1)
 
 pyautogui.FAILSAFE = False
 
-last_cast_time = {}
-cooldown_sec = 2
 gesture_hold = {"label": None, "start_time": 0}
-HOLD_DURATION = 0.05
+HOLD_DURATION = 0.01
+last_cast_time = {}
+cooldown_sec = 0
 
-right_hand_x_history = deque(maxlen=3)
-right_hand_y_history = deque(maxlen=3)
-turning_left = turning_right = looking_up = looking_down = False
+held_keys = {"w": False, "a": False, "q": False, "s": False, "d": False, "z": False}
+spell_keys = {"1": False, "2": False, "3": False, "4": False}
 
-left_hand_movement = {"w": False, "a": False, "s": False, "d": False}
-
-# --- Helpers ---
-def cast_spell(spell_key, name):
-    now = time.time()
-    if spell_key not in last_cast_time or (now - last_cast_time[spell_key]) > cooldown_sec:
-        pyautogui.press(spell_key)
-        print(f"✨ Cast {name} (key {spell_key})")
-        last_cast_time[spell_key] = now
-        return name
-    return None
+swipe_cooldown = 1
+last_swipe_time = 0
+last_fist_time = 0
 
 def is_finger_up(lm, tip, pip):
-    return lm[tip].y < lm[pip].y - 0.02
+    return lm[pip].y - lm[tip].y > 0.015
 
 def get_finger_states(lm):
     return {
@@ -45,32 +37,108 @@ def get_finger_states(lm):
         "pinky": is_finger_up(lm, 20, 18)
     }
 
-def is_open_palm(states):
-    return states["index"] and states["middle"] and states["ring"] and states["pinky"] and not states["thumb"]
+def cast_spell(key, label):
+    now = time.time()
+    if key not in last_cast_time or (now - last_cast_time[key]) > cooldown_sec:
+        pyautogui.press(key)
+        last_cast_time[key] = now
 
-def is_fist(states):
-    return not any(states.values())
+def hold_key(key):
+    if not held_keys[key]:
+        pyautogui.keyDown(key)
+        held_keys[key] = True
 
-def is_two_fingers_up(states):
-    return states["index"] and states["middle"] and not states["ring"] and not states["pinky"]
+def release_key(key):
+    if held_keys[key]:
+        pyautogui.keyUp(key)
+        held_keys[key] = False
 
-def is_index_middle_ring_up(states):
-    return states["index"] and states["middle"] and states["ring"] and not states["pinky"]
+def detect_hand(states, lm):
+    global last_swipe_time, last_fist_time
 
-def is_index_middle_ring_pinky_up(states):
-    return states["index"] and states["middle"] and states["ring"] and states["pinky"] and not states["thumb"]
+    now = time.time()
+    swipe_active = False
+    for k in spell_keys: spell_keys[k] = False
 
-def is_point_forward(states):
-    return states["index"] and not any(states[f] for f in ["middle", "ring", "pinky"])
+    # Fist = release all keys
+    curled = sum(1 for up in states.values() if not up)
+    if curled >= 4 and now - last_fist_time > swipe_cooldown:
+        last_fist_time = now
+        for key in held_keys:
+            pyautogui.keyUp(key)
+            held_keys[key] = False
+        gesture_hold["label"] = None
+        return
 
-def is_both_hands_fist(results):
-    if len(results.multi_hand_landmarks) < 2:
-        return False
-    lm1 = results.multi_hand_landmarks[0].landmark
-    lm2 = results.multi_hand_landmarks[1].landmark
-    return is_fist(get_finger_states(lm1)) and is_fist(get_finger_states(lm2))
+    combo = frozenset(k for k, v in states.items() if v)
 
-# --- Main Loop ---
+    # Swipe Up/Down with open palm
+    if combo == frozenset(["thumb", "index", "middle", "ring", "pinky"]):
+        current_y = lm[9].y
+        if hasattr(detect_hand, "prev_y") and detect_hand.prev_y is not None:
+            dy = current_y - detect_hand.prev_y
+            if dy > 0.05 and now - last_swipe_time > swipe_cooldown:
+                pyautogui.press("space")  # Jump
+                last_swipe_time = now
+                swipe_active = True
+            elif dy < -0.05 and now - last_swipe_time > swipe_cooldown:
+                pyautogui.press("ctrl")  # Roll
+                last_swipe_time = now
+                swipe_active = True
+        detect_hand.prev_y = current_y
+
+        if not swipe_active:
+            hold_key("w")
+        else:
+            release_key("w")
+    else:
+        detect_hand.prev_y = None
+        release_key("w")
+
+    if swipe_active:
+        return
+
+    # Thumb + Index = hold Z
+    if combo == frozenset(["thumb", "index"]):
+        hold_key("z")
+    else:
+        release_key("z")
+
+    # Thumb + Index + Middle = hold Q
+    if combo == frozenset(["thumb", "index", "middle"]):
+        hold_key("q")
+    else:
+        release_key("q")
+
+    # Middle + Ring only = hold S
+    if combo == frozenset(["middle", "ring"]):
+        hold_key("s")
+    else:
+        release_key("s")
+
+    # Only pinky = hold A
+    if combo == frozenset(["pinky"]):
+        hold_key("a")
+    else:
+        release_key("a")
+
+    # Only thumb = hold D
+    if combo == frozenset(["thumb"]):
+        hold_key("d")
+    else:
+        release_key("d")
+
+    # Spells
+    if combo == frozenset(["index"]):
+        spell_keys["1"] = True
+    elif combo == frozenset(["index", "middle"]):
+        spell_keys["2"] = True
+    elif combo == frozenset(["index", "middle", "ring"]):
+        spell_keys["3"] = True
+    elif combo == frozenset(["thumb", "index", "middle", "ring"]):
+        spell_keys["4"] = True
+
+# Main loop
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
@@ -79,108 +147,27 @@ while cap.isOpened():
     frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
-    gesture_label = "None"
-    spell_key = None
     now = time.time()
 
-    turning_left = turning_right = looking_up = looking_down = False
-    left_hand_movement = {k: False for k in left_hand_movement}
-
-    stop_all = is_both_hands_fist(results) if results.multi_hand_landmarks else False
-
-    if results.multi_hand_landmarks and results.multi_handedness:
-        for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
             lm = hand_landmarks.landmark
-            hand_label = results.multi_handedness[i].classification[0].label
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
             states = get_finger_states(lm)
-            hand_x = lm[0].x
-            hand_y = lm[0].y
+            detect_hand(states, lm)
 
-            if hand_label == "Right":
-                if is_open_palm(states):
-                    right_hand_x_history.append(hand_x)
-                    right_hand_y_history.append(hand_y)
-                    if len(right_hand_x_history) >= 3:
-                        dx = right_hand_x_history[-1] - right_hand_x_history[0]
-                        dy = right_hand_y_history[-1] - right_hand_y_history[0]
-                        if dx > 0.01:
-                            turning_right = True
-                        elif dx < -0.01:
-                            turning_left = True
-                        if dy < -0.01:
-                            looking_up = True
-                        elif dy > 0.01:
-                            looking_down = True
+    for key, active in spell_keys.items():
+        if active:
+            if gesture_hold["label"] != key:
+                gesture_hold["label"] = key
+                gesture_hold["start_time"] = now
+            elif now - gesture_hold["start_time"] >= HOLD_DURATION:
+                cast_spell(key, f"Spell {key}")
+                gesture_hold["label"] = None
+        else:
+            if gesture_hold["label"] == key:
+                gesture_hold["label"] = None
 
-                # Spells
-                if is_fist(states):
-                    gesture_label = "Time Stop"
-                    spell_key = '8'
-                elif is_two_fingers_up(states):
-                    gesture_label = "Stun"
-                    spell_key = '2'
-                elif is_index_middle_ring_up(states):
-                    gesture_label = "Heal"
-                    spell_key = '3'
-                elif is_index_middle_ring_pinky_up(states) and not (turning_left or turning_right or looking_up or looking_down):
-                    gesture_label = "Barrier"
-                    spell_key = '4'
-                elif is_point_forward(states):
-                    gesture_label = "Laser"
-                    spell_key = '1'
-
-                # Right thumb toward camera = "a"
-                if lm[4].z < lm[3].z and not any(states[f] for f in ["index", "middle", "ring", "pinky"]):
-                    left_hand_movement["a"] = True
-
-            elif hand_label == "Left" and not stop_all:
-                if is_fist(states) or (states["pinky"] and not any(states[f] for f in ["thumb", "index", "middle", "ring"])):
-                    left_hand_movement = {k: False for k in left_hand_movement}
-                elif states["thumb"] and all(states[f] for f in ["index", "middle", "ring", "pinky"]):
-                    left_hand_movement["w"] = True
-                elif states["index"] and states["middle"] and not any(states[f] for f in ["ring", "pinky", "thumb"]):
-                    left_hand_movement["s"] = True
-                elif states["thumb"] and not any(states[f] for f in ["index", "middle", "ring", "pinky"]):
-                    left_hand_movement["d"] = True
-
-    # Handle camera
-    if turning_right:
-        pyautogui.keyDown('right'); pyautogui.keyUp('left')
-    elif turning_left:
-        pyautogui.keyDown('left'); pyautogui.keyUp('right')
-    else:
-        pyautogui.keyUp('left'); pyautogui.keyUp('right')
-
-    if looking_up:
-        pyautogui.keyDown('up'); pyautogui.keyUp('down')
-    elif looking_down:
-        pyautogui.keyDown('down'); pyautogui.keyUp('up')
-    else:
-        pyautogui.keyUp('up'); pyautogui.keyUp('down')
-
-    # Handle WASD
-    for key, active in left_hand_movement.items():
-        if active: pyautogui.keyDown(key)
-        else: pyautogui.keyUp(key)
-
-    # Spells (hold logic)
-    if gesture_label != "None" and spell_key is not None:
-        if gesture_label != gesture_hold["label"]:
-            gesture_hold["label"] = gesture_label
-            gesture_hold["start_time"] = now
-        elif now - gesture_hold["start_time"] >= HOLD_DURATION:
-            cast_spell(spell_key, gesture_label)
-            gesture_hold["label"] = None
-    else:
-        gesture_hold["label"] = None
-
-    # Show
-    label_ascii = gesture_label.encode('ascii', 'ignore').decode()
-    cv2.putText(frame, f"Gesture: {label_ascii}", (10, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
     cv2.imshow("Spellcaster", frame)
-
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
